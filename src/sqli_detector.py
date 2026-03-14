@@ -11,7 +11,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
 from difflib import SequenceMatcher
-#################################################### ต้นฉบับ + skeleton ########################################################333
+
 
 # ======================================================
 # Hybrid SQLi Detector
@@ -25,52 +25,37 @@ class SQLiDetector:
         self.scaler = None
         self.rf_model = None
 
-        # ======================================================
         # Signature patterns
-        # ======================================================
-
         self.signature_patterns = {
 
-            "union_based": [
-                r"\bunion\s+(all\s+)?select\b"
+            "union-based": [
+                r"union\s+select",
+                r"union\s+all\s+select"
             ],
 
-            "error_based": [
-                r"\b(updatexml|extractvalue|floor\(|geometrycollection|multipoint|exp\(|rand\()"
+            "error-based": [
+                r"extractvalue\s*\(",
+                r"updatexml\s*\(",
+                r"floor\s*\(\s*rand\s*\(",
+                r"group\s+by\s+.*rand",
+                r"information_schema",
+                r"mysql_fetch",
+                r"syntax\s+error"
             ],
 
-            "time_based": [
-                r"\b(sleep|benchmark|waitfor\s+delay|pg_sleep|dbms_lock\.sleep)\b"
-            ],
-
-            "boolean_based": [
-                r"\b(and|or)\b\s+['\"]?\w+['\"]?\s*=\s*['\"]?\w+['\"]?"
+            "time-based": [
+                r"sleep\s*\(",
+                r"benchmark\s*\(",
+                r"pg_sleep\s*\(",
+                r"waitfor\s+delay"
             ]
         }
 
-        # ======================================================
-        # Fuzzy keywords
-        # ======================================================
-
-        self.fuzzy_keywords = [
-
-            "union select",
-            "sleep",
-            "benchmark",
-            "waitfor delay",
-            "information_schema",
-            "extractvalue",
-            "updatexml"
-
-        ]
-
-        self.fuzzy_threshold = 0.85
-
     # ======================================================
-    # Dataset Cleaning
+    # Data Cleaning
     # ======================================================
 
-    def clean_dataset(self, df):
+    def clean_data(self, df):
 
         print("Cleaning dataset...")
 
@@ -80,42 +65,9 @@ class SQLiDetector:
         df["payload"] = df["payload"].astype(str)
 
         df = df[df["payload"].str.strip() != ""]
-        df = df[df["payload"].str.len() >= 7]
-
-        df = df[~df["payload"].str.match(r"^\d+$")]
+        df = df[df["payload"].str.len() > 3]
 
         return df
-
-    # ======================================================
-    # Recursive URL Decode
-    # ======================================================
-
-    def recursive_decode(self, text, max_decode=5):
-
-        count = 0
-
-        while "%" in text and count < max_decode:
-
-            new = urllib.parse.unquote(text)
-
-            if new == text:
-                break
-
-            text = new
-            count += 1
-
-        return text
-
-    # ======================================================
-    # Remove SQL Comments
-    # ======================================================
-
-    def remove_comments(self, text):
-
-        text = re.sub(r'(--|#).*?(\n|$)', ' ', text)
-        text = re.sub(r'/\*.*?\*/', ' ', text, flags=re.DOTALL)
-
-        return text
 
     # ======================================================
     # Normalization
@@ -125,12 +77,8 @@ class SQLiDetector:
 
         text = str(text)
 
-        text = self.recursive_decode(text)
-
+        text = urllib.parse.unquote(text)
         text = text.lower()
-
-        text = self.remove_comments(text)
-
         text = re.sub(r"\s+", " ", text)
 
         return text.strip()
@@ -156,44 +104,14 @@ class SQLiDetector:
     # Tokenization
     # ======================================================
 
-    def tokenize(self, text):
+    def tokenize_sql(self, query):
 
-        tokens = re.findall(r"[a-zA-Z_]+|CONST_[A-Z_]+", text)
+        tokens = re.findall(
+            r"[a-zA-Z_]+|\d+|!=|==|<=|>=|['\"].*?['\"]|[^\s]",
+            str(query)
+        )
 
         return tokens
-
-    # ======================================================
-    # Statistical Features
-    # ======================================================
-
-    def extract_stat_features(self, text):
-
-        return np.array([
-            len(text),
-            text.count("'"),
-            text.count(";"),
-            text.count("="),
-            text.count("--"),
-            text.count("/*"),
-            text.count(" or "),
-            text.count(" and ")
-        ])
-
-    # ======================================================
-    # Transform Pipeline
-    # ======================================================
-
-    def transform(self, text):
-
-        normalized = self.normalize(text)
-
-        skeleton = self.skeletonize(normalized)
-
-        tokens = self.tokenize(skeleton)
-
-        stat = self.extract_stat_features(skeleton)
-
-        return tokens, stat
 
     # ======================================================
     # Word2Vec Vector
@@ -235,12 +153,10 @@ class SQLiDetector:
                 if re.search(pattern, payload):
                     return True, f"{category} signature"
 
-        for keyword in self.fuzzy_keywords:
+                score = self.fuzzy_similarity(payload, pattern)
 
-            score = self.fuzzy_similarity(payload, keyword)
-
-            if score >= self.fuzzy_threshold:
-                return True, "fuzzy keyword"
+                if score > 0.75:
+                    return True, f"fuzzy {category} signature"
 
         return False, None
 
@@ -250,7 +166,9 @@ class SQLiDetector:
 
     def train_and_evaluate(self, df):
 
-        df = self.clean_dataset(df)
+        df = self.clean_data(df)
+
+        df["payload"] = df["payload"].apply(self.normalize)
 
         X = df["payload"]
         y = df["label"].values
@@ -267,27 +185,14 @@ class SQLiDetector:
             random_state=42
         )
 
-        print("\nTransforming data...")
+        # ใช้ skeleton ก่อน tokenize
+        X_train_tokens = X_train_raw.apply(
+            lambda x: self.tokenize_sql(self.skeletonize(x))
+        )
 
-        X_train_tokens = []
-        X_train_stats = []
-
-        for text in X_train_raw:
-
-            tokens, stat = self.transform(text)
-
-            X_train_tokens.append(tokens)
-            X_train_stats.append(stat)
-
-        X_test_tokens = []
-        X_test_stats = []
-
-        for text in X_test_raw:
-
-            tokens, stat = self.transform(text)
-
-            X_test_tokens.append(tokens)
-            X_test_stats.append(stat)
+        X_test_tokens = X_test_raw.apply(
+            lambda x: self.tokenize_sql(self.skeletonize(x))
+        )
 
         print("\nTraining Word2Vec...")
 
@@ -301,19 +206,13 @@ class SQLiDetector:
             epochs=40
         )
 
-        X_train_vec = np.vstack([self.get_vector(t) for t in X_train_tokens])
-        X_test_vec = np.vstack([self.get_vector(t) for t in X_test_tokens])
-
-        X_train_stats = np.vstack(X_train_stats)
-        X_test_stats = np.vstack(X_test_stats)
-
-        X_train_final = np.hstack([X_train_vec, X_train_stats])
-        X_test_final = np.hstack([X_test_vec, X_test_stats])
+        X_train_vec = np.vstack(X_train_tokens.apply(self.get_vector))
+        X_test_vec = np.vstack(X_test_tokens.apply(self.get_vector))
 
         self.scaler = StandardScaler()
 
-        X_train_scaled = self.scaler.fit_transform(X_train_final)
-        X_test_scaled = self.scaler.transform(X_test_final)
+        X_train_scaled = self.scaler.fit_transform(X_train_vec)
+        X_test_scaled = self.scaler.transform(X_test_vec)
 
         print("\nTraining RandomForest...")
 
@@ -354,15 +253,15 @@ class SQLiDetector:
 
     def save_model(self, path="models/sqli_detector.pkl"):
 
-        data = {
-            "w2v_model": self.w2v_model,
-            "scaler": self.scaler,
-            "rf_model": self.rf_model
+        data_to_save = {
+            'w2v_model': self.w2v_model,
+            'scaler': self.scaler,
+            'rf_model': self.rf_model
         }
 
-        joblib.dump(data, path)
+        joblib.dump(data_to_save, path)
 
-        print(f"\nModel saved to {path}")
+        print(f"\n✅ Brain saved to {path}")
 
     # ======================================================
     # Load Model
@@ -373,15 +272,22 @@ class SQLiDetector:
 
         data = joblib.load(path)
 
-        detector = SQLiDetector()
+        new_detector = SQLiDetector()
 
-        detector.w2v_model = data["w2v_model"]
-        detector.scaler = data["scaler"]
-        detector.rf_model = data["rf_model"]
+        if isinstance(data, dict):
 
-        print("Model loaded successfully")
+            new_detector.w2v_model = data.get('w2v_model')
+            new_detector.scaler = data.get('scaler')
+            new_detector.rf_model = data.get('rf_model')
 
-        return detector
+            print("✅ Brain extracted and linked to detector.")
+
+        else:
+            new_detector = data
+
+        print(f"✅ Model loaded from {path}")
+
+        return new_detector
 
     # ======================================================
     # Predict Payload
@@ -389,9 +295,12 @@ class SQLiDetector:
 
     def predict_single(self, payload):
 
-        payload_norm = self.normalize(payload)
+        if self.rf_model is None:
+            raise Exception("Model not loaded")
 
-        sig_detect, reason = self.signature_check(payload_norm)
+        payload = self.normalize(payload)
+
+        sig_detect, reason = self.signature_check(payload)
 
         if sig_detect:
 
@@ -401,13 +310,14 @@ class SQLiDetector:
                 "reason": reason
             }
 
-        tokens, stat = self.transform(payload)
+        # ใช้ skeleton ก่อน tokenize
+        payload = self.skeletonize(payload)
+
+        tokens = self.tokenize_sql(payload)
 
         vec = self.get_vector(tokens)
 
-        features = np.hstack([vec, stat])
-
-        vec_scaled = self.scaler.transform([features])
+        vec_scaled = self.scaler.transform([vec])
 
         pred = self.rf_model.predict(vec_scaled)[0]
 
